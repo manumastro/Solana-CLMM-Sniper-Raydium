@@ -14,7 +14,13 @@ const QUOTE_TOKENS = new Set([
     'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'  // USDT
 ]);
 
+// Istanza globale del PaperTrader
+let globalPaperTrader: PaperTrader | null = null;
+
 async function monitorClmmPools(connection: Connection) {
+  // Inizializza il global paper trader
+  globalPaperTrader = new PaperTrader(connection);
+
   console.log(chalk.green(`🟢 Sniping Raydium CLMM su: ${CLMM_PROGRAM_ID.toString()}`));
 
   connection.onLogs(
@@ -125,8 +131,7 @@ function identifyToken(mint0: string, mint1: string, vault0: string, vault1: str
     console.log(chalk.blue(`Dex: https://dexscreener.com/solana/${tokenAddress}`));
     console.log(chalk.cyan('='.repeat(50)));
 
-    if (quoteAddress) {
-        const paperTrader = new PaperTrader(connection);
+    if (quoteAddress && globalPaperTrader) {
         const poolData: PoolData = {
             baseMint: tokenAddress,
             quoteMint: quoteAddress,
@@ -140,7 +145,8 @@ function identifyToken(mint0: string, mint1: string, vault0: string, vault1: str
         // let tokenAmount = inverted ? quoteBal : baseBal;
         // If inverted=false: solAmount = quoteBal (QuoteVault), tokenAmount = baseBal (TokenVault). Correct.
         
-        paperTrader.startTracking(poolData, false).catch(err => {
+        // Avvia il tracking in parallelo (non blocca il monitoraggio di altre pool)
+        globalPaperTrader.startTracking(poolData, false).catch(err => {
             console.error(chalk.red(`Errore avvio Paper Trader: ${err}`));
         });
     }
@@ -150,4 +156,14 @@ const solanaConnection = new Connection(process.env.RPC_ENDPOINT!, {
     wsEndpoint: process.env.RPC_WEBSOCKET_ENDPOINT,
     commitment: 'confirmed'
 });
+
 monitorClmmPools(solanaConnection);
+
+// Gestisci graceful shutdown
+process.on('SIGINT', async () => {
+    console.log(chalk.yellow('\n⏹️  Arresto graceful del monitoraggio...\n'));
+    if (globalPaperTrader) {
+        globalPaperTrader.stopAll();
+    }
+    process.exit(0);
+});
