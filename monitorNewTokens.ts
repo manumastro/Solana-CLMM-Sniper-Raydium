@@ -9,8 +9,6 @@ const CLMM_PROGRAM_ID = new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgr
 
 const QUOTE_TOKENS = new Set([
     'So11111111111111111111111111111111111111112', // SOL
-    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'  // USDT
 ]);
 
 async function monitorClmmPools(connection: Connection) {
@@ -22,14 +20,14 @@ async function monitorClmmPools(connection: Connection) {
     async ({ logs, err, signature }) => {
       if (err) return;
 
-      // FILTRO CHIRURGICO: Solo istruzioni di creazione
       const isCreation = logs.some(log => 
           log.includes('Instruction: CreatePool') || 
           log.includes('Instruction: create_pool')
       );
 
       if (isCreation) {
-        console.log(chalk.yellow(`⚡ Rilevata Creazione Pool! Fetching Raw Tx...`));
+        console.log(chalk.yellow(`⚡ Rilevata Creazione Pool! Sig: ${signature}`));
+        // Avviamo il processamento
         processNewPoolRaw(connection, signature);
       }
     },
@@ -37,26 +35,36 @@ async function monitorClmmPools(connection: Connection) {
   );
 }
 
-// Funzione Ottimizzata: Usa getTransaction (Raw) invece di getParsedTransaction
-async function processNewPoolRaw(connection: Connection, signature: string) {
-    try {
-        // 1. FETCH PIÙ LEGGERO
-        // Usiamo maxSupportedTransactionVersion: 0 per supportare Look-Up Tables (LUT)
+// Funzione Helper per riprovare la fetch se il nodo è lento (Propagation Delay)
+async function fetchTransactionWithRetry(connection: Connection, signature: string, maxRetries = 5) {
+    for (let i = 0; i < maxRetries; i++) {
         const tx = await connection.getTransaction(signature, {
             maxSupportedTransactionVersion: 0,
             commitment: 'confirmed'
         });
+        if (tx) return tx;
+    }
+    return null;
+}
 
-        if (!tx || !tx.transaction || !tx.transaction.message) return;
+async function processNewPoolRaw(connection: Connection, signature: string) {
+    try {
+        // 1. FETCH CON RETRY (Fondamentale per i logs stream)
+        const tx = await fetchTransactionWithRetry(connection, signature);
 
-        // 2. RISOLUZIONE ACCOUNT (La parte difficile del Raw)
-        // Dobbiamo ricostruire l'array completo degli account combinando staticKeys e loadedAddresses (LUT)
-        const accountKeys = tx.transaction.message.getAccountKeys();
+        if (!tx || !tx.transaction || !tx.transaction.message || !tx.meta) {
+            console.log(chalk.red("Tx non trovata o incompleta dopo i retry."));
+            return;
+        }
+
+        // 2. RISOLUZIONE ACCOUNT (LA FIX È QUI) 🛠️
+        // Per le transazioni V0, getAccountKeys ha bisogno dei loadedAddresses dai metadata
+        const accountKeys = tx.transaction.message.getAccountKeys({
+            accountKeysFromLookups: tx.meta.loadedAddresses
+        });
         
         // 3. TROVARE L'ISTRUZIONE CLMM
-        // Invece di cercare per stringa, cerchiamo l'istruzione che invoca il Program ID
         const instructions = tx.transaction.message.compiledInstructions;
-        
         const clmmInstruction = instructions.find(ix => {
             const programId = accountKeys.get(ix.programIdIndex);
             return programId?.equals(CLMM_PROGRAM_ID);
@@ -64,16 +72,13 @@ async function processNewPoolRaw(connection: Connection, signature: string) {
 
         if (!clmmInstruction) return;
 
-        // 4. ESTRAZIONE DEGLI INDICI (Mapping Deterministico)
-        // L'ordine degli account in 'CreatePool' è fisso nell'istruzione:
-        // Index 3: Mint 0
-        // Index 4: Mint 1
-        // Index 5: Vault 0
-        // Index 6: Vault 1
-        // (Nota: Gli indici nell'array `accounts` dell'istruzione puntano all'array globale `accountKeys`)
-        
+        // 4. ESTRAZIONE INDICI
         const accountsIndices = clmmInstruction.accountKeyIndexes;
         
+        // Raydium CLMM CreatePool Accounts (Indices):
+        // 0: PoolCreator, 1: AmmConfig, 2: PoolState
+        // 3: TokenMint0, 4: TokenMint1
+        // 5: TokenVault0, 6: TokenVault1
         if (accountsIndices.length < 7) return;
 
         const mint0 = accountKeys.get(accountsIndices[3])?.toString();
@@ -101,7 +106,6 @@ function identifyToken(mint0: string, mint1: string, vault0: string, vault1: str
         quoteAddress = mint1;
         tokenAddress = mint0;
     } else {
-        // Coppia ignorata (es. USDC/USDT)
         return; 
     }
 
@@ -129,7 +133,7 @@ function identifyToken(mint0: string, mint1: string, vault0: string, vault1: str
 
 const solanaConnection = new Connection(process.env.RPC_ENDPOINT!, {
     wsEndpoint: process.env.RPC_WEBSOCKET_ENDPOINT,
-    commitment: 'confirmed' // Consigliato 'confirmed' per la fetch della TX completa
+    commitment: 'confirmed'
 });
 
 monitorClmmPools(solanaConnection);

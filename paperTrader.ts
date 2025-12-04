@@ -17,12 +17,17 @@ export class PaperTrader {
     private maxPrice: number = 0;
     private startTime: number = 0;
 
-    // CONFIGURAZIONE STRATEGIA (SCALPING)
-    private readonly TAKE_PROFIT = 5; // Vendi a +5%
-    private readonly HARD_STOP_LOSS = 10; // Vendi a -10% (Protezione)
+    // CONFIGURAZIONE STRATEGIA "MOONSHOT SECURE"
+    private readonly TAKE_PROFIT = 10;      // Target ambizioso (+10%)
+    private readonly INITIAL_STOP_LOSS = 5; // Stop Loss iniziale (-5%)
+    private readonly BREAKEVEN_TRIGGER = 5; // A +5% di profitto, sposta SL a 0%
     
-    // SIMULAZIONE SOLDI (Per calcolo profitto)
-    private readonly INVESTMENT_SOL = 1.0; // Simuliamo di investire 1 SOL
+    // STATO DINAMICO
+    private currentStopLevel = -5; // Parte da -5, diventerà 0
+    private isBreakevenActive = false;
+
+    // SIMULAZIONE SOLDI
+    private readonly INVESTMENT_SOL = 1.0; 
 
     constructor(connection: Connection) {
         this.connection = connection;
@@ -32,8 +37,13 @@ export class PaperTrader {
         poolData: PoolData,
         inverted: boolean
     ) {
-        console.log(chalk.cyan(`\n📜 AVVIO PAPER TRADER: SCALP MODE (Fixed TP)`));
-        console.log(chalk.gray(`   Take Profit: +${this.TAKE_PROFIT}% | Stop Loss: -${this.HARD_STOP_LOSS}%`));
+        // Reset stato
+        this.currentStopLevel = -this.INITIAL_STOP_LOSS;
+        this.isBreakevenActive = false;
+
+        console.log(chalk.cyan(`\n📜 AVVIO PAPER TRADER: BREAKEVEN STRATEGY`));
+        console.log(chalk.gray(`   TP: +${this.TAKE_PROFIT}% | Initial SL: -${this.INITIAL_STOP_LOSS}%`));
+        console.log(chalk.yellow(`   ⚡ TRIGGER: Se PnL >= +${this.BREAKEVEN_TRIGGER}%, SL diventa 0%`));
         console.log(chalk.gray(`   Simulazione su size: ${this.INVESTMENT_SOL} SOL`));
         
         this.isTracking = true;
@@ -53,7 +63,7 @@ export class PaperTrader {
                     continue;
                 }
 
-                // 2. Calcolo Prezzo (SOL per Token)
+                // 2. Calcolo Prezzo
                 let solAmount = inverted ? baseBal.value.uiAmount : quoteBal.value.uiAmount;
                 let tokenAmount = inverted ? quoteBal.value.uiAmount : baseBal.value.uiAmount;
 
@@ -61,7 +71,7 @@ export class PaperTrader {
 
                 let currentPrice = solAmount / tokenAmount;
 
-                // 3. INIZIALIZZAZIONE (Primo Tick)
+                // 3. INIZIALIZZAZIONE
                 if (this.initialPrice === 0) {
                     this.initialPrice = currentPrice;
                     this.maxPrice = currentPrice;
@@ -72,45 +82,51 @@ export class PaperTrader {
                     console.log('-'.repeat(50));
                 }
 
-                // 4. LOGICA STATICA
+                // 4. LOGICA DI TRADING
                 if (currentPrice > this.maxPrice) this.maxPrice = currentPrice;
 
-                // Calcolo Target Price (Dove vogliamo vendere)
-                const targetPrice = this.initialPrice * (1 + (this.TAKE_PROFIT / 100));
-                
                 // Calcolo PnL attuale
                 const pnlPercent = ((currentPrice - this.initialPrice) / this.initialPrice) * 100;
-                
-                // 5. VISUALIZZAZIONE REAL-TIME
+
+                // --- LOGICA BREAKEVEN ---
+                if (!this.isBreakevenActive && pnlPercent >= this.BREAKEVEN_TRIGGER) {
+                    this.isBreakevenActive = true;
+                    this.currentStopLevel = 0; // Sposta SL a 0
+                    console.log(chalk.blueBright.bold(`\n🛡️  SECURIZED! Profit >= ${this.BREAKEVEN_TRIGGER}%. Stop Loss moved to BREAKEVEN (0%).`));
+                }
+
+                // 5. VISUALIZZAZIONE
                 const elapsed = (Date.now() - this.startTime) / 1000;
                 let pnlColor = pnlPercent >= 0 ? chalk.green : chalk.red;
                 
                 // Formattiamo l'output
+                // Mostriamo lo Stop Level attuale (che può cambiare da -5 a 0)
                 process.stdout.write(
                     `\r ⏱️ ${elapsed.toFixed(0)}s | ` +
                     `Price: ${chalk.white(currentPrice.toFixed(9))} | ` +
-                    `Target: ${chalk.cyan(targetPrice.toFixed(9))} | ` +
+                    `SL Level: ${this.isBreakevenActive ? chalk.cyan('0.00% (BE)') : chalk.red('-5.00%')} | ` +
                     `PnL: ${pnlColor(pnlPercent.toFixed(2) + '%')}`
                 );
 
                 // 6. CONTROLLO VENDITA
                 
-                // Caso A: Take Profit (+5%)
+                // Caso A: Take Profit (+40%)
                 if (pnlPercent >= this.TAKE_PROFIT) {
-                    this.executeSell("TAKE PROFIT", currentPrice, pnlPercent);
+                    this.executeSell("MOONSHOT TP", currentPrice, pnlPercent);
                     break;
                 }
 
-                // Caso B: Stop Loss (-10%)
-                if (pnlPercent <= -this.HARD_STOP_LOSS) {
-                    this.executeSell("STOP LOSS", currentPrice, pnlPercent);
+                // Caso B: Stop Loss Dinamico (o -5% o 0%)
+                // Nota: Usiamo < invece di <= per dare un minimo di respiro sullo zero esatto (floating point)
+                if (pnlPercent < this.currentStopLevel - 0.01) { 
+                    const reason = this.isBreakevenActive ? "BREAKEVEN EXIT" : "STOP LOSS";
+                    this.executeSell(reason, currentPrice, pnlPercent);
                     break;
                 }
 
                 await new Promise(r => setTimeout(r, 100)); 
 
             } catch (e) {
-                console.error(chalk.red(`Errore Paper Trader: ${e}`));
                 await new Promise(r => setTimeout(r, 1000));
             }
         }
@@ -119,13 +135,12 @@ export class PaperTrader {
     private executeSell(reason: string, price: number, pnlPercent: number) {
         console.log(`\n\n` + '='.repeat(50));
         
-        // Calcolo Profitto in SOL
-        // Profitto = Investimento * (Percentuale / 100)
-        // Esempio: 1 SOL * (5 / 100) = 0.05 SOL
         const profitSol = this.INVESTMENT_SOL * (pnlPercent / 100);
 
         if (pnlPercent > 0) {
             console.log(chalk.greenBright.bold(`✅ ${reason} HIT!`));
+        } else if (Math.abs(pnlPercent) < 0.1) {
+            console.log(chalk.cyan.bold(`🛡️ ${reason} HIT (Safe Exit)!`));
         } else {
             console.log(chalk.redBright.bold(`🛑 ${reason} HIT!`));
         }
